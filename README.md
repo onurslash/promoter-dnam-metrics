@@ -137,6 +137,9 @@ The CAMDA implementation is obtained by the processing script from the original 
 
 Other software versions and the R session used for the statistical analysis are recorded by the scripts and by `sessionInfo()` in the rendered Quarto output.
 
+## License
+
+This repository is released under the MIT License. See `LICENSE` for details.
 
 ## Author
 
