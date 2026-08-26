@@ -1,0 +1,752 @@
+---
+title: "Promoter DNA methylation metrics and gene expression in human CD3+ T cells"
+subtitle: "Complete analysis: every table and figure, computed from the data"
+author: "R. Onur Öztornacı"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+  cache: true
+---
+
+## Scope
+
+This document produces every number and every figure in the manuscript from the
+three files written by `01_download_and_align.sh`. Nothing is entered by hand:
+each table is computed from the data, and each figure is drawn from the objects
+those computations return.
+
+| File | Content |
+|---|---|
+| `data/Methylation.tsv` | per-CpG methylation ratio, BSMAP `methratio` schema |
+| `data/CAMDA.tsv` | per-CpG concurrence ratio, same schema, `C_count` holds the concurrence count |
+| `data/CD3.isoforms.results` | RSEM transcript quantification |
+
+Reference files (`ref/gencode.v19.annotation.gtf`, `ref/refGene.txt`,
+`ref/cgi.bed`) are fetched by the same script.
+
+The two per-CpG tables are roughly 2.3 GB each; peak memory is about 16 GB and a
+full run takes one to two hours, most of it in the grid and the bootstraps.
+
+```{r setup}
+library(data.table)
+setDTthreads(0)
+set.seed(1)
+
+## ---- analysis constants: change here, everything downstream follows --------
+UP        <- 1000L   # bp upstream of the TSS
+DOWN      <- 500L    # bp downstream
+BIN       <- 100L    # bin width
+MIN_CPG   <- 10L     # CpGs per bin, primary bin analysis
+MIN_CPG_F <- 3L      # CpGs per bin, fixed-set analysis
+COV_BIN   <- 10L     # per-CpG coverage, conventional in WGBS analysis
+COV_LOW   <- 4L      # per-CpG coverage matching the published benchmark
+PSEUDO    <- 0.1     # offset when zero-expression transcripts are retained
+NBOOT     <- 2000L   # bootstrap replicates
+
+DATA <- "data"; REF <- "ref"; FIGDIR <- "figures"
+dir.create(FIGDIR, showWarnings = FALSE)
+
+BINS   <- (UP + DOWN) / BIN
+BREAKS <- seq(-UP, DOWN - BIN, BIN)
+MID    <- BREAKS + BIN / 2
+
+rho  <- function(x, y) cor(x, y, method = "spearman")
+H    <- function(b) { h <- -(b * log2(b) + (1 - b) * log2(1 - b))
+                      fifelse(b <= 0 | b >= 1, 0, h) }
+fold <- function(b) 1 - 2 * abs(b - 0.5)
+```
+
+`H(0)` and `H(1)` are set to their limiting value of zero. Evaluating the
+expression directly at those points returns `NaN`; dropping the resulting
+missing values would silently remove every promoter whose CpGs are uniformly
+committed, and would leave the entropy tables computed on a different CpG set
+from the other two metrics.
+
+## Input
+
+```{r inputs}
+gtf <- fread(cmd = sprintf("awk -F'\t' '$3==\"transcript\"' %s/gencode.v19.annotation.gtf", REF),
+             select = c(1, 4, 5, 7, 9), col.names = c("chr","gs","ge","strand","attr"))
+gtf[, transcript_id := sub('.*transcript_id "([^".]+).*', "\\1", attr)]
+gtf[, gene_id       := sub('.*gene_id "([^".]+).*',       "\\1", attr)]
+gtf[, gene_name     := sub('.*gene_name "([^"]+)".*',     "\\1", attr)]
+gtf[, tss   := fifelse(strand == "+", gs, ge)]
+gtf[, txlen := ge - gs]
+gtf <- gtf[chr %in% paste0("chr", c(1:22, "X", "Y"))]
+
+rg <- fread(file.path(REF, "refGene.txt"), header = FALSE, select = c(2,3,4,5,6,13),
+            col.names = c("nm","chr","strand","txStart","txEnd","gene_name"))
+rg <- rg[chr %in% paste0("chr", c(1:22, "X", "Y"))]
+rg[, tss   := fifelse(strand == "+", txStart, txEnd)]
+rg[, txlen := txEnd - txStart]
+
+rna <- fread(file.path(DATA, "CD3.isoforms.results"),
+             select = c("transcript_id","gene_id","FPKM"))
+rna[, transcript_id := sub("\\..*", "", transcript_id)]
+rna[, gene_id       := sub("\\..*", "", gene_id)]
+
+meth <- fread(file.path(DATA, "Methylation.tsv"), select = c("chr","pos","C_count","CT_count"))
+camd <- fread(file.path(DATA, "CAMDA.tsv"),       select = c("chr","pos","C_count","CT_count"))
+setnames(camd, c("C_count","CT_count"), c("A_count","AT_count"))
+
+site <- merge(meth, camd, by = c("chr","pos"))
+rm(meth, camd); invisible(gc())
+site[, `:=`(start = pos, end = pos)]
+
+cgi <- fread(file.path(REF, "cgi.bed"), col.names = c("chr","cs","ce"))
+setkey(cgi, chr, cs, ce)
+
+cat(sprintf("CpG sites carrying both metrics: %s\n", format(nrow(site), big.mark = ",")))
+cat(sprintf("annotated CpG islands: %s\n", format(nrow(cgi), big.mark = ",")))
+```
+
+## Promoter construction
+
+`build_prom()` returns one promoter window per unit of analysis. Zero-expression
+transcripts are either dropped, in which case expression is `log2(FPKM)`, or
+retained under `log2(FPKM + PSEUDO)`. Excluding them conditions on the outcome,
+so their treatment is carried as an explicit factor rather than fixed.
+
+```{r build-prom}
+build_prom <- function(anno = "gencode", level = "transcript",
+                       sel = "fpkm", zero = FALSE) {
+  if (anno == "gencode") {
+    b <- merge(gtf[, .(transcript_id, gene_id, chr, strand, tss, txlen)],
+               rna[, .(transcript_id, FPKM)], by = "transcript_id")
+  } else {
+    ## RNA-seq was quantified against the GENCODE transcriptome, so RefSeq has
+    ## no transcript-level abundance of its own: isoforms are summed to the
+    ## locus and matched by gene symbol. Every RefSeq transcript of a gene then
+    ## carries the same value, which is why an expression-based selection rule
+    ## cannot discriminate among them (see the gene-selection section).
+    gsum <- merge(rna, unique(gtf[, .(gene_id, gene_name)]), by = "gene_id")[
+              , .(FPKM = sum(FPKM)), by = gene_name]
+    b <- merge(rg[, .(gene_name, chr, strand, tss, txlen, nm)], gsum, by = "gene_name")
+    b[, `:=`(gene_id = gene_name, transcript_id = nm)]
+  }
+  if (!zero) b <- b[FPKM > 0]
+  b[, y := if (zero) log2(FPKM + PSEUDO) else log2(FPKM)]
+
+  if (level == "gene")
+    b <- switch(sel,
+      fpkm      = b[b[, .I[which.max(FPKM)],  by = gene_id]$V1],
+      longest   = b[b[, .I[which.max(txlen)], by = gene_id]$V1],
+      canonical = { z <- copy(b)
+                    z[, pri := if (anno == "refseq")
+                                 fifelse(grepl("^NM_", transcript_id), 0L, 1L) else 0L]
+                    z[order(pri, -txlen)][, .SD[1], by = gene_id] })
+
+  b[, `:=`(wstart = fifelse(strand == "+", tss - UP,   tss - DOWN),
+           wend   = fifelse(strand == "+", tss + DOWN, tss + UP))]
+  setkey(b, chr, wstart, wend)
+  b[, .(transcript_id, chr, strand, tss, y, wstart, wend)]
+}
+```
+
+## Aggregation
+
+With $C_i, CT_i$ the methylated and total read counts at CpG $i$ and
+$A_i, AT_i$ the corresponding concurrence counts, over the $k$ CpGs surviving
+the coverage filter in a region:
+
+$$
+\text{pooled} = \frac{\sum_i C_i}{\sum_i CT_i},
+\qquad
+\text{CpG-weighted} = \frac{1}{k}\sum_i \frac{C_i}{CT_i}
+$$
+
+and likewise $\sum A_i / \sum AT_i$ and $k^{-1}\sum A_i/AT_i$ for CAMDA. Entropy
+has no pooled counterpart of this form because it is not a ratio of counts. Two
+distinct regional quantities exist and are kept separate throughout: the mean of
+per-CpG entropies $k^{-1}\sum H(\beta_i)$ and the folding transform applied to
+the regional mean, $f(\bar\beta)$. They agree at 100 bp and diverge across the
+whole promoter, which is the subject of the aggregation-scale section.
+
+```{r agg}
+wp_metrics <- function(prom, mincov = COV_LOW, agg = "pooled") {
+  s <- site[CT_count >= mincov & AT_count >= mincov]
+  o <- foverlaps(s, prom, by.x = c("chr","start","end"), nomatch = 0L)
+  if (agg == "pooled")
+    o[, .(n = .N,
+          wgbs    = sum(C_count) / sum(CT_count),
+          camda   = sum(A_count) / sum(AT_count),
+          entropy = mean(H(C_count / CT_count)),
+          y = y[1]), by = transcript_id]
+  else
+    o[, .(n = .N,
+          wgbs    = mean(C_count / CT_count),
+          camda   = mean(A_count / AT_count),
+          entropy = mean(H(C_count / CT_count)),
+          y = y[1]), by = transcript_id]
+}
+
+bin_metrics <- function(prom, mincov = COV_BIN, min_cpg = MIN_CPG) {
+  s <- site[CT_count >= mincov & AT_count >= mincov]
+  o <- foverlaps(s, prom, by.x = c("chr","start","end"), nomatch = 0L)
+  o[, dist := fifelse(strand == "+", pos - tss, tss - pos)]
+  o <- o[dist >= -UP & dist < DOWN]
+  o[, bin := findInterval(dist, BREAKS)]
+  b <- o[, .(n_cpg = .N, chr = chr[1],
+             wgbs    = mean(C_count / CT_count),
+             camda   = mean(A_count / AT_count),
+             entropy = mean(H(C_count / CT_count)),
+             y = y[1]),
+         by = .(transcript_id, bin)][n_cpg >= min_cpg]
+  ## The entropy comparison contrasts the MEAN of per-CpG entropies against the
+  ## folding transform APPLIED TO the bin mean. These are different objects:
+  ##   mean(H(beta_i))  vs  f(mean(beta_i)),  and  f(mean b) != mean(f(b)).
+  b[, fold_of_mean := fold(wgbs)]
+  b[]
+}
+```
+
+## Bin-level correlations
+
+```{r bins}
+prom_tx <- build_prom("gencode", "transcript", zero = TRUE)
+mb <- bin_metrics(prom_tx)
+
+pos_label <- function(k) sprintf("%+d / %+d", BREAKS[k], BREAKS[k] + BIN)
+
+tab2 <- mb[, .(N = .N, CAMDA = rho(camda, y), `Mean WGBS` = rho(wgbs, y),
+               `b-Entropy` = rho(entropy, y)), by = bin][order(bin)]
+tab2[, Position := pos_label(bin)]
+setcolorder(tab2, c("bin","Position","N"))
+
+tab1 <- mb[, .(`mean per-CpG H` = rho(entropy, y),
+               `folded mean b`  = rho(fold_of_mean, y)), by = bin][order(bin)]
+tab1[, gap := abs(`mean per-CpG H` - `folded mean b`)]
+tab1[, Position := pos_label(bin)]
+setcolorder(tab1, c("bin","Position"))
+
+knitr::kable(tab1, digits = 4, caption = "Table 1")
+knitr::kable(tab2, digits = 3, caption = "Table 2")
+
+cat(sprintf("largest bin-level gap between the two entropy forms: %.4f\n", max(tab1$gap)))
+cat(sprintf("strongest bin: %s (CAMDA rho = %.3f)\n",
+            tab2[which.max(abs(CAMDA)), Position], tab2[which.max(abs(CAMDA)), CAMDA]))
+```
+
+## Fixed promoter set
+
+Per-bin sample size varies with position because CpG density rises toward the
+TSS, so the positional profile is repeated on the promoters that have data in
+every bin.
+
+```{r fixed-set}
+mbf  <- bin_metrics(prom_tx, min_cpg = MIN_CPG_F)
+keep <- mbf[, .N, by = transcript_id][N == BINS, transcript_id]
+fx   <- mbf[transcript_id %in% keep]
+
+boot_rho_ci <- function(x, y, B = NBOOT) {
+  n <- length(x)
+  v <- vapply(seq_len(B), function(.) { i <- sample.int(n, n, TRUE); rho(x[i], y[i]) },
+              numeric(1))
+  unname(quantile(v, c(.025, .975)))
+}
+
+fxci <- fx[, {
+  cc <- boot_rho_ci(camda, y); ww <- boot_rho_ci(wgbs, y); ee <- boot_rho_ci(entropy, y)
+  .(n = .N,
+    camda = rho(camda, y),     camda_lo = cc[1], camda_hi = cc[2],
+    wgbs  = rho(wgbs,  y),     wgbs_lo  = ww[1], wgbs_hi  = ww[2],
+    entropy = rho(entropy, y), ent_lo   = ee[1], ent_hi   = ee[2])
+}, by = bin][order(bin)]
+
+cat(sprintf("fixed set: %d promoters with data in all %d bins\n", length(keep), BINS))
+knitr::kable(fxci, digits = 3)
+```
+
+## Paired bootstrap, two resampling units
+
+Promoters sharing a chromosome are not exchangeable, so the comparison is
+repeated with chromosomes as the resampling unit.
+
+```{r bootstrap}
+boot_delta <- function(dd, metric, block = FALSE, B = NBOOT) {
+  x <- dd[[metric]]; w <- dd$wgbs; yy <- dd$y
+  obs <- abs(rho(x, yy)) - abs(rho(w, yy))
+  v <- if (!block) {
+    n <- length(x)
+    vapply(seq_len(B), function(.) { i <- sample.int(n, n, TRUE)
+      abs(rho(x[i], yy[i])) - abs(rho(w[i], yy[i])) }, numeric(1))
+  } else {
+    idx <- split(seq_along(x), dd$chr); ks <- names(idx)
+    vapply(seq_len(B), function(.) {
+      i <- unlist(idx[sample(ks, length(ks), TRUE)], use.names = FALSE)
+      abs(rho(x[i], yy[i])) - abs(rho(w[i], yy[i])) }, numeric(1))
+  }
+  list(delta = obs, lo = unname(quantile(v, .025)), hi = unname(quantile(v, .975)))
+}
+
+boot <- rbindlist(lapply(c("camda","entropy"), function(m)
+  rbindlist(lapply(c(FALSE, TRUE), function(bl)
+    cbind(metric = m, unit = if (bl) "chromosome" else "promoter",
+          mb[, c(boot_delta(.SD, m, bl)), by = bin,
+             .SDcols = c(m, "wgbs", "y", "chr")])))))
+boot[, `:=`(excludes_zero = lo > 0 | hi < 0, Position = pos_label(bin))]
+
+knitr::kable(dcast(boot[metric == "camda"], bin + Position ~ unit,
+                   value.var = c("delta","lo","hi")), digits = 4,
+             caption = "Tables 3 and 8: CAMDA versus mean methylation")
+boot[, .(bins_excluding_zero = sum(excludes_zero), of = .N), by = .(metric, unit)]
+cat(sprintf("largest CAMDA advantage in any bin: %.4f\n",
+            boot[metric == "camda" & unit == "promoter", max(delta)]))
+cat(sprintf("largest entropy difference in any bin: %.4f\n",
+            boot[metric == "entropy" & unit == "promoter", max(abs(delta))]))
+```
+
+## Sensitivity grid across all estimable combinations
+
+Five binary choices. One annotation-by-level combination is not estimable, which
+accounts for eight of the thirty-two cells because the other three factors are
+crossed within it: RNA-seq was quantified against the GENCODE v19 transcriptome,
+so transcript-level abundances exist for GENCODE accessions but not for RefSeq
+ones, and RefSeq enters only at the gene level where isoform abundances are
+summed to the locus. The design is therefore crossed over all estimable
+combinations rather than fully crossed.
+
+```{r grid}
+grid <- CJ(anno = c("gencode","refseq"), level = c("transcript","gene"),
+           mincov = c(COV_LOW, COV_BIN), agg = c("pooled","cpgwt"),
+           zero = c(TRUE, FALSE), sorted = FALSE)
+n_full <- nrow(grid)
+grid   <- grid[!(anno == "refseq" & level == "transcript")]   # not estimable
+
+full <- rbindlist(lapply(seq_len(nrow(grid)), function(i) {
+  g <- grid[i]
+  m <- wp_metrics(build_prom(g$anno, g$level, "fpkm", g$zero), g$mincov, g$agg)
+  m <- m[is.finite(wgbs) & is.finite(camda) & is.finite(entropy) & is.finite(y)]
+  cbind(g, n = nrow(m), wgbs = rho(m$wgbs, m$y),
+        camda = rho(m$camda, m$y), entropy = rho(m$entropy, m$y))
+}))
+full[, config := sprintf("%s / %s / >=%dx / %s / %s",
+                         fifelse(anno == "gencode", "GENCODE", "RefSeq"),
+                         fifelse(level == "transcript", "tx", "gene"),
+                         mincov, fifelse(agg == "cpgwt", "CpG-wt", "pooled"),
+                         fifelse(zero, "0-kept", "0-drop"))]
+full[, best := c("CAMDA","Mean WGBS","b-Entropy")[
+       apply(abs(cbind(camda, wgbs, entropy)), 1, which.max)]]
+
+knitr::kable(full[, .(config, n, wgbs, camda, entropy, best)], digits = 3,
+             caption = "Table 4: all estimable configurations")
+
+cat(sprintf("design: %d of %d cells estimable\n", nrow(full), n_full))
+cat(sprintf("mean-methylation range: %.3f to %.3f (span %.3f)\n",
+            max(full$wgbs), min(full$wgbs), diff(range(full$wgbs))))
+cat(sprintf("largest between-metric difference at fixed configuration: %.3f\n",
+            full[, max(pmax(abs(camda), abs(wgbs), abs(entropy)) -
+                       pmin(abs(camda), abs(wgbs), abs(entropy)))]))
+print(full[, .N, by = best])
+```
+
+### Marginal effects on common support
+
+RefSeq enters only at the gene level, so a naive gene-minus-transcript contrast
+would confound quantification level with annotation source. The two unbalanced
+factors are therefore estimated where both of their levels exist: the level
+effect within GENCODE, the annotation effect within gene-level analysis. The
+other three factors are balanced over every estimable cell and are averaged
+directly.
+
+```{r marginal}
+marg <- rbindlist(lapply(c("wgbs","camda","entropy"), function(mt) {
+  r <- copy(full)[, v := abs(get(mt))]
+  data.table(
+    metric = mt,
+    `level (gene vs transcript, within GENCODE)` =
+        mean(r$v[r$anno == "gencode" & r$level == "gene"]) -
+        mean(r$v[r$anno == "gencode" & r$level == "transcript"]),
+    `annotation (RefSeq vs GENCODE, within gene)` =
+        mean(r$v[r$anno == "refseq"]) -
+        mean(r$v[r$anno == "gencode" & r$level == "gene"]),
+    `zero-expression (kept vs dropped)` = mean(r$v[r$zero]) - mean(r$v[!r$zero]),
+    `coverage (high vs low threshold)` =
+        mean(r$v[r$mincov == COV_BIN]) - mean(r$v[r$mincov == COV_LOW]),
+    `aggregation (CpG-wt vs pooled)` =
+        mean(r$v[r$agg == "cpgwt"]) - mean(r$v[r$agg == "pooled"]))
+}))
+knitr::kable(marg, digits = 3, caption = "Table 5: marginal effects")
+
+mlong <- melt(marg, id.vars = "metric", variable.name = "choice", value.name = "effect")
+cat(sprintf("largest marginal effect over all metrics and choices: %.3f\n",
+            max(abs(mlong$effect))))
+print(mlong[, .(largest_choice = as.character(choice[which.max(abs(effect))]),
+                effect = effect[which.max(abs(effect))]), by = metric])
+```
+
+## Representative transcript per gene
+
+The highest-FPKM rule selects on the outcome variable. Two
+expression-independent rules are compared against it. The comparison is
+informative only under GENCODE: because quantification was against the GENCODE
+transcriptome, RefSeq transcripts of a locus all inherit the same summed
+gene-level abundance, so the highest-FPKM rule cannot discriminate among them
+and resolves ties by annotation order.
+
+```{r gene-selection}
+sel_res <- rbindlist(lapply(c("gencode","refseq"), function(a)
+  rbindlist(lapply(c("fpkm","longest","canonical"), function(s) {
+    m <- wp_metrics(build_prom(a, "gene", s, FALSE), COV_LOW, "cpgwt")
+    m <- m[is.finite(wgbs) & is.finite(camda) & is.finite(y)]
+    data.table(anno = a, rule = s, n = nrow(m),
+               wgbs = rho(m$wgbs, m$y), camda = rho(m$camda, m$y))
+  }))))
+mtx <- wp_metrics(build_prom("gencode", "transcript", "fpkm", FALSE), COV_LOW, "cpgwt")
+mtx <- mtx[is.finite(wgbs) & is.finite(camda) & is.finite(y)]
+sel_res <- rbind(data.table(anno = "gencode", rule = "all transcripts", n = nrow(mtx),
+                            wgbs = rho(mtx$wgbs, mtx$y), camda = rho(mtx$camda, mtx$y)),
+                 sel_res)
+knitr::kable(sel_res, digits = 3, caption = "Table 6")
+
+sg <- sel_res[anno == "gencode"]
+cat(sprintf("selection-rule effect (GENCODE, mean methylation): %.3f\n",
+            abs(sg[rule == "fpkm", wgbs]) - abs(sg[rule == "canonical", wgbs])))
+cat(sprintf("transcript-to-gene effect (GENCODE, mean methylation): %.3f\n",
+            abs(sg[rule == "canonical", wgbs]) - abs(sg[rule == "all transcripts", wgbs])))
+cat(sprintf("spread across the three RefSeq rules: %.3f\n",
+            diff(range(abs(sel_res[anno == "refseq", wgbs])))))
+```
+
+## Aggregation scale and the Jensen gap
+
+```{r jensen}
+p_sc <- build_prom("gencode", "transcript", zero = FALSE)
+o_sc <- foverlaps(site[CT_count >= COV_BIN], p_sc,
+                  by.x = c("chr","start","end"), nomatch = 0L)
+o_sc[, b := C_count / CT_count]
+
+wp_sc <- o_sc[, .(n = .N, b_pool = sum(C_count)/sum(CT_count),
+                  mH = mean(H(b)), mfold = mean(fold(b)), y = y[1]),
+              by = transcript_id][n >= MIN_CPG]
+
+scale_wp <- data.table(
+  quantity = c("pooled beta", "folded pooled beta", "H(pooled beta)",
+               "mean per-CpG H", "mean per-CpG folded"),
+  rho = c(rho(wp_sc$b_pool, wp_sc$y), rho(fold(wp_sc$b_pool), wp_sc$y),
+          rho(H(wp_sc$b_pool), wp_sc$y), rho(wp_sc$mH, wp_sc$y),
+          rho(wp_sc$mfold, wp_sc$y)))
+knitr::kable(scale_wp, digits = 3, caption = "Whole-promoter quantities")
+
+gap_wp <- abs(scale_wp[quantity == "mean per-CpG H", rho] -
+              scale_wp[quantity == "folded pooled beta", rho])
+cat(sprintf("whole-promoter gap %.3f over %d bp | largest bin gap %.4f over %d bp | n = %s\n",
+            gap_wp, UP + DOWN, max(tab1$gap), BIN, format(nrow(wp_sc), big.mark = ",")))
+```
+
+## CpG-island stratification
+
+```{r cgi}
+prom_rs <- build_prom("refseq", "gene", "fpkm", FALSE)
+m_rs    <- wp_metrics(prom_rs, COV_LOW, "cpgwt")
+
+label_cgi <- function(prom) {
+  z <- unique(prom[, .(transcript_id, chr, tss, wstart, wend)])
+  z[, `:=`(ts = tss, te = tss)]
+  z[, cgi_tss := !is.na(foverlaps(z, cgi, by.x = c("chr","ts","te"),
+                                  by.y = c("chr","cs","ce"), which = TRUE, mult = "first"))]
+  z[, cgi_ovl := !is.na(foverlaps(z, cgi, by.x = c("chr","wstart","wend"),
+                                  by.y = c("chr","cs","ce"), which = TRUE, mult = "first"))]
+  z[, .(transcript_id, cgi_tss, cgi_ovl)]
+}
+
+zrs <- merge(m_rs, label_cgi(prom_rs), by = "transcript_id")
+zrs <- zrs[is.finite(wgbs) & is.finite(camda) & is.finite(y)]
+
+cgi_strata <- rbind(
+  zrs[,                 .(stratum = "all",        n = .N, camda = rho(camda,y), wgbs = rho(wgbs,y))],
+  zrs[cgi_tss == TRUE,  .(stratum = "island",     n = .N, camda = rho(camda,y), wgbs = rho(wgbs,y))],
+  zrs[cgi_tss == FALSE, .(stratum = "non-island", n = .N, camda = rho(camda,y), wgbs = rho(wgbs,y))])
+knitr::kable(cgi_strata, digits = 3, caption = "Table 7")
+cat(sprintf("island-associated under the TSS definition: %.1f%%\n", 100 * mean(zrs$cgi_tss)))
+```
+
+### Definition of island association
+
+```{r cgi-defn}
+ztx <- merge(wp_metrics(prom_tx, COV_BIN, "cpgwt"), label_cgi(prom_tx), by = "transcript_id")
+ztx <- ztx[is.finite(wgbs) & is.finite(camda) & is.finite(y)]
+
+cgi_defn <- rbindlist(lapply(c("cgi_tss","cgi_ovl"), function(v) {
+  z <- copy(ztx)[, g := get(v)]
+  rbind(z[g == TRUE,  .(defn = v, stratum = "island",     n = .N,
+                        camda = rho(camda,y), wgbs = rho(wgbs,y))],
+        z[g == FALSE, .(defn = v, stratum = "non-island", n = .N,
+                        camda = rho(camda,y), wgbs = rho(wgbs,y))])
+}))
+knitr::kable(cgi_defn, digits = 3, caption = "Table 10")
+cat(sprintf("island share: TSS-in-island %.1f%%, window-overlap %.1f%%\n",
+            100 * mean(ztx$cgi_tss), 100 * mean(ztx$cgi_ovl)))
+```
+
+## CpG density and coverage
+
+Two proxies for the read-level entropy restriction of the published benchmark.
+Phased reads cannot be recovered from per-site tables. Promoter set: GENCODE
+gene-level, highest-FPKM representative transcript, zero-expression transcripts
+dropped.
+
+```{r coverage-setup}
+prom_cov <- build_prom("gencode", "gene", "fpkm", zero = FALSE)
+
+## Two overlaps are needed and they are not interchangeable.
+##   ocov_all : NO coverage filter. Required for frac_ge, the proportion of a
+##              promoter's CpGs reaching the threshold. Filtering first would
+##              make that quantity identically 1.
+##   ocov_lo  : filtered at COV_LOW, used where the metric itself must rest on
+##              sufficiently covered sites only.
+ocov_all <- foverlaps(site, prom_cov, by.x = c("chr","start","end"), nomatch = 0L)
+ocov_lo  <- ocov_all[CT_count >= COV_LOW]
+```
+
+```{r coverage-cpg}
+g_lo <- ocov_lo[, .(nCpG = .N, medcov = as.numeric(median(CT_count)),
+                    wgbs = sum(C_count)/sum(CT_count), y = y[1]),
+                by = transcript_id]
+
+cpg_sweep <- rbindlist(lapply(c(1L, MIN_CPG, 3L * MIN_CPG, 5L * MIN_CPG), function(k) {
+  z <- g_lo[nCpG >= k]
+  data.table(min_CpG = k, n = nrow(z), rho = rho(z$wgbs, z$y))
+}))
+knitr::kable(cpg_sweep, digits = 3, caption = "Table 9a: minimum CpGs per promoter")
+
+g_all <- ocov_all[, .(nCpG_all = .N, min_cov = min(CT_count),
+                      nCpG_ge = sum(CT_count >= COV_LOW),
+                      frac_ge = mean(CT_count >= COV_LOW),
+                      wgbs = sum(C_count[CT_count >= COV_LOW]) /
+                             sum(CT_count[CT_count >= COV_LOW]),
+                      y = y[1]),
+                  by = transcript_id][is.finite(wgbs)]
+
+cat(sprintf("promoters with at least %d CpGs, all of them reaching %dx: %d\n",
+            COV_LOW, COV_LOW, nrow(g_all[nCpG_all >= COV_LOW & min_cov >= COV_LOW])))
+```
+
+```{r coverage-homogeneity}
+zh <- g_all[nCpG_ge >= COV_LOW]
+zh[, tert := cut(frac_ge, quantile(frac_ge, 0:3/3), include.lowest = TRUE,
+                 labels = c("low","mid","high"))]
+homog <- zh[, .(n = .N, median_frac = median(frac_ge), rho = rho(wgbs, y)),
+            by = tert][order(tert)]
+
+g_lo[, tert := cut(medcov, quantile(medcov, 0:3/3), include.lowest = TRUE,
+                   labels = c("low","mid","high"))]
+depth <- g_lo[, .(n = .N, median_coverage = median(medcov), rho = rho(wgbs, y)),
+              by = tert][order(tert)]
+
+knitr::kable(homog, digits = 3, caption = "Table 9b: coverage homogeneity tertiles")
+knitr::kable(depth, digits = 3, caption = "Table 9c: median coverage tertiles")
+```
+
+```{r coverage-threshold}
+thr_grid <- sort(unique(c(COV_LOW, seq(COV_LOW, 5L * COV_LOW, by = 2L), COV_BIN)))
+thr_sweep <- rbindlist(lapply(thr_grid, function(k) {
+  z <- ocov_all[CT_count >= k,
+                .(nCpG = .N, wgbs = sum(C_count)/sum(CT_count), y = y[1]),
+                by = transcript_id][nCpG >= COV_LOW]
+  data.table(min_cov = k, n = nrow(z), rho = rho(z$wgbs, z$y))
+}))
+knitr::kable(thr_sweep, digits = 3, caption = "Table 9d: per-CpG coverage threshold")
+
+cat(sprintf("coefficient at the lowest threshold %.3f, strongest %.3f at %dx\n",
+            thr_sweep[1, rho], thr_sweep[which.min(rho), rho],
+            thr_sweep[which.min(rho), min_cov]))
+```
+
+If sparse coverage inflated the association, raising the threshold would weaken
+it. The opposite happens, so sequencing depth does not explain the difference
+from the published value.
+
+## Figures
+
+Every figure below is drawn from the objects computed above.
+
+```{r fig-helper}
+CAM <- "#1b7837"; WGB <- "#762a83"; ENT <- "#e08214"
+
+save_fig <- function(name, w, h, draw) {
+  png(file.path(FIGDIR, paste0(name, ".png")), width = w, height = h,
+      units = "in", res = 600, type = "cairo")
+  par(family = "serif"); draw(); dev.off()
+  pdf(file.path(FIGDIR, paste0(name, ".pdf")), width = w, height = h)
+  par(family = "serif"); draw(); dev.off()
+  invisible(NULL)
+}
+xt   <- pretty(c(-UP, DOWN), 5)
+barx <- function(n) seq(0.7, by = 1.08, length.out = n)   # midpoints of barplot bars
+```
+
+### Figure 1 — positional profile
+
+```{r fig1}
+draw_fig1 <- function() {
+  layout(matrix(1:4, 2, 2, byrow = TRUE), heights = c(3, 1.25))
+  par(mar = c(2.0, 4.4, 2.4, 0.8), cex.axis = 0.82, cex.lab = 0.92)
+
+  plot(MID, tab2$CAMDA, type = "n", xaxt = "n",
+       ylim = rev(range(c(tab2$CAMDA, tab2$`Mean WGBS`, tab2$`b-Entropy`))),
+       xlab = "", ylab = expression("Spearman " * rho * " with " * log[2] * "(FPKM)"))
+  axis(1, at = xt, labels = FALSE); abline(v = 0, col = "grey55", lty = 2)
+  for (s in list(list(tab2$CAMDA, CAM, 21), list(tab2$`Mean WGBS`, WGB, 22),
+                 list(tab2$`b-Entropy`, ENT, 24)))
+    lines(MID, s[[1]], type = "b", col = s[[2]], pch = s[[3]],
+          bg = "white", lwd = 1.4, cex = 0.8)
+  mtext("(A)  All promoters", side = 3, adj = 0, line = 0.6, font = 2, cex = 0.88)
+
+  par(mar = c(4.0, 4.4, 2.4, 0.8))
+  plot(MID, fxci$camda, type = "n", xaxt = "n",
+       ylim = rev(range(c(fxci$camda_lo, fxci$camda_hi, fxci$wgbs_lo, fxci$wgbs_hi))),
+       xlab = "Distance from TSS (bp)", ylab = expression(rho))
+  axis(1, at = xt); abline(v = 0, col = "grey55", lty = 2)
+  for (s in list(list(fxci$camda_lo, fxci$camda_hi, CAM),
+                 list(fxci$wgbs_lo,  fxci$wgbs_hi,  WGB)))
+    polygon(c(MID, rev(MID)), c(s[[1]], rev(s[[2]])),
+            col = adjustcolor(s[[3]], alpha.f = 0.15), border = NA)
+  for (s in list(list(fxci$camda, CAM, 21), list(fxci$wgbs, WGB, 22),
+                 list(fxci$entropy, ENT, 24)))
+    lines(MID, s[[1]], type = "b", col = s[[2]], pch = s[[3]],
+          bg = "white", lwd = 1.4, cex = 0.8)
+  mtext(sprintf("(B)  Fixed set, n = %d", length(keep)),
+        side = 3, adj = 0, line = 0.6, font = 2, cex = 0.88)
+
+  par(mar = c(4.0, 4.4, 0.4, 0.8))
+  barplot(tab2$N / 1000, space = 0.08, col = "grey80", border = "grey45",
+          names.arg = rep("", nrow(tab2)), ylab = expression("N (" %*% 10^3 * ")"))
+  axis(1, at = approx(c(-UP, DOWN), range(barx(nrow(tab2))), xt)$y, labels = xt)
+  mtext("Distance from TSS (bp)", side = 1, line = 2.4, cex = 0.78)
+
+  par(mar = c(0, 0, 0, 0)); plot.new()
+  legend("center", c("CAMDA", "Mean WGBS", expression(beta * "-entropy")),
+         col = c(CAM, WGB, ENT), pch = c(21, 22, 24), pt.bg = "white",
+         lwd = 1.4, bty = "n", cex = 0.95)
+}
+save_fig("Figure1_bin_profile", 7.0, 4.3, draw_fig1)
+knitr::include_graphics(file.path(FIGDIR, "Figure1_bin_profile.png"))
+```
+
+### Figure 2 — paired bootstrap, two resampling units
+
+```{r fig2}
+bc_p <- boot[metric == "camda"   & unit == "promoter"  ][order(bin)]
+bc_c <- boot[metric == "camda"   & unit == "chromosome"][order(bin)]
+be_p <- boot[metric == "entropy" & unit == "promoter"  ][order(bin)]
+
+draw_fig2 <- function() {
+  par(mar = c(4.2, 4.6, 1.0, 0.8), cex.axis = 0.82, cex.lab = 0.92)
+  off <- BIN * 0.16
+  plot(MID, bc_p$delta, type = "n", xaxt = "n",
+       ylim = range(c(bc_c$lo, bc_c$hi, be_p$delta, 0)) * c(1.2, 1.15),
+       xlab = "Distance from TSS (bp)",
+       ylab = expression(Delta * "|" * rho * "| vs mean WGBS"))
+  axis(1, at = xt); abline(h = 0, col = "grey30"); abline(v = 0, col = "grey55", lty = 2)
+  segments(MID - off, bc_c$lo, MID - off, bc_c$hi,
+           col = adjustcolor("grey40", alpha.f = 0.55), lwd = 5, lend = 1)
+  arrows(MID - off, bc_p$lo, MID - off, bc_p$hi, angle = 90, code = 3,
+         length = 0.02, col = CAM, lwd = 1.1)
+  points(MID - off, bc_p$delta, pch = 21, col = CAM, bg = "white", cex = 0.85)
+  points(MID + off, be_p$delta, pch = 24, col = ENT, bg = "white", cex = 0.85)
+  legend("topright", bty = "n", cex = 0.78,
+         legend = c("CAMDA, promoter interval", "CAMDA, chromosome-block interval",
+                    expression(beta * "-entropy")),
+         col = c(CAM, adjustcolor("grey40", alpha.f = 0.55), ENT),
+         pch = c(21, NA, 24), lwd = c(1.1, 5, NA), pt.bg = "white")
+}
+save_fig("Figure2_delta_bootstrap", 6.0, 3.4, draw_fig2)
+knitr::include_graphics(file.path(FIGDIR, "Figure2_delta_bootstrap.png"))
+```
+
+### Figure 3 — every estimable configuration
+
+```{r fig3}
+draw_fig3 <- function() {
+  g <- full[order(anno, level, mincov, agg, -zero)]
+  k <- nrow(g); yy <- k:1
+  par(mar = c(4.4, 14, 0.8, 0.8), cex.axis = 0.7)
+  plot(NA, xlim = range(c(g$wgbs, g$camda, g$entropy, 0)), ylim = c(0.2, k + 0.8),
+       yaxt = "n", ylab = "",
+       xlab = expression("Whole-promoter Spearman " * rho * " with " * log[2] * "(FPKM)"))
+  abline(v = 0, col = "grey30")
+  segments(pmin(g$wgbs, g$camda, g$entropy), yy,
+           pmax(g$wgbs, g$camda, g$entropy), yy, col = "grey83", lwd = 1.3)
+  points(g$camda,   yy, pch = 19, col = CAM, cex = 0.8)
+  points(g$wgbs,    yy, pch = 15, col = WGB, cex = 0.8)
+  points(g$entropy, yy, pch = 17, col = ENT, cex = 0.8)
+  axis(2, at = yy, labels = g$config, las = 1, tick = FALSE, line = -0.5)
+  legend("bottomleft", c("CAMDA", "Mean WGBS", expression(beta * "-entropy")),
+         col = c(CAM, WGB, ENT), pch = c(19, 15, 17), bty = "n",
+         horiz = TRUE, cex = 0.78)
+}
+save_fig("Figure3_full_grid", 7.4, 6.6, draw_fig3)
+knitr::include_graphics(file.path(FIGDIR, "Figure3_full_grid.png"))
+```
+
+### Figure 4 — CpG-island stratification
+
+```{r fig4}
+draw_fig4 <- function() {
+  s <- cgi_strata
+  par(mar = c(4.0, 4.6, 0.8, 0.8), cex.axis = 0.82, cex.lab = 0.92)
+  m  <- rbind(abs(s$camda), abs(s$wgbs))
+  bp <- barplot(m, beside = TRUE, col = c(CAM, WGB), border = "black",
+                ylim = c(0, max(m) * 1.24),
+                ylab = expression("|Spearman " * rho * "|"),
+                names.arg = sprintf("%s\n(n = %s)", s$stratum,
+                                    format(s$n, big.mark = ",")))
+  text(as.vector(bp), as.vector(m) + max(m) * 0.03,
+       sprintf("%.3f", c(rbind(s$camda, s$wgbs))), cex = 0.7)
+  legend("topright", c("CAMDA", "Mean WGBS"), fill = c(CAM, WGB), bty = "n", cex = 0.82)
+}
+save_fig("Figure4_cgi_strata", 4.8, 3.3, draw_fig4)
+knitr::include_graphics(file.path(FIGDIR, "Figure4_cgi_strata.png"))
+```
+
+### Figure 5 — aggregation scale
+
+```{r fig5}
+draw_fig5 <- function() {
+  layout(matrix(1:2, 1, 2), widths = c(1.3, 1))
+  par(mar = c(4.2, 4.8, 2.2, 0.6), cex.axis = 0.82, cex.lab = 0.9)
+
+  barplot(tab1$gap, space = 0.08, col = ENT, border = "grey30",
+          ylim = c(0, max(c(tab1$gap, gap_wp)) * 1.3),
+          names.arg = rep("", nrow(tab1)),
+          ylab = expression("|" * Delta * rho * "| between the two entropy forms"))
+  axis(1, at = approx(c(-UP, DOWN), range(barx(nrow(tab1))), xt)$y, labels = xt)
+  mtext("Distance from TSS (bp)", side = 1, line = 2.4, cex = 0.8)
+  abline(h = gap_wp, col = WGB, lty = 2, lwd = 1.5)
+  text(0.4, gap_wp * 1.07, sprintf("whole-promoter gap = %.3f", gap_wp),
+       adj = 0, col = WGB, cex = 0.72)
+  mtext(sprintf("(A)  %d bp bins", BIN), side = 3, adj = 0, line = 0.6,
+        font = 2, cex = 0.88)
+
+  par(mar = c(4.2, 10, 2.2, 1.8))
+  s    <- scale_wp[rev(seq_len(.N))]
+  cols <- fifelse(grepl("^pooled", s$quantity), WGB,
+           fifelse(grepl("per-CpG", s$quantity), ENT, "grey55"))
+  bp <- barplot(abs(s$rho), horiz = TRUE, col = cols, border = "black",
+                xlim = c(0, max(abs(s$rho)) * 1.26),
+                names.arg = rep("", nrow(s)),
+                xlab = expression("|Spearman " * rho * "|"))
+  axis(2, at = bp, labels = s$quantity, las = 1, tick = FALSE, cex.axis = 0.74)
+  text(abs(s$rho) + max(abs(s$rho)) * 0.03, bp, sprintf("%.3f", s$rho),
+       cex = 0.7, adj = 0)
+  mtext(sprintf("(B)  Whole promoter (%s bp)", format(UP + DOWN, big.mark = ",")),
+        side = 3, adj = 0, line = 0.6, font = 2, cex = 0.88)
+}
+save_fig("Figure5_aggregation_scale", 7.0, 3.4, draw_fig5)
+knitr::include_graphics(file.path(FIGDIR, "Figure5_aggregation_scale.png"))
+```
+
+## Session
+
+```{r session}
+sessionInfo()
+```
