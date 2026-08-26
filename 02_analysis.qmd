@@ -2,7 +2,7 @@
 title: "Promoter DNA methylation metrics and gene expression in human CD3+ T cells"
 subtitle: "Complete analysis: every table and figure, computed from the data"
 author: "R. Onur Öztornacı"
-date: today
+date: 
 format:
   html:
     toc: true
